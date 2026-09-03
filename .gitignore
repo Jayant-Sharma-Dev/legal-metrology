@@ -4,3 +4,8 @@ node_modules/
 *.log
 uploads/
 reports/
+
+# Python
+backend/.venv/
+__pycache__/
+*.py[cod]

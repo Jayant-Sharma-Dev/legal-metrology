@@ -24,10 +24,6 @@ app.add_middleware(
 # ── Gemini client ─────────────────────────────────────────────────────────────
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-@app.get("/models")
-async def list_models():
-    models = client.models.list()
-    return {"models": [m.name for m in models]}
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
 
@@ -95,7 +91,7 @@ async def inspect_product(image: UploadFile = File(...)):
         )
 
         response = client.models.generate_content(
-            model="gemini-1.5-flash",
+            model="gemini-2.5-flash",
             contents=[image_part, EXTRACTION_PROMPT],
         )
 

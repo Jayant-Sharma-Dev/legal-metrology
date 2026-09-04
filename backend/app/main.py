@@ -33,10 +33,11 @@ app = FastAPI(title="Legal Metrology Compliance System")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://legal-metrology-orcin.vercel.app",
-    ],
+   allow_origins=[
+    "http://localhost:3000",
+    "https://legal-metrology-orcin.vercel.app",  # ← add this
+    "https://*.vercel.app",                        # ← covers preview deploys
+],
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],

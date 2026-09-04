@@ -21,7 +21,7 @@ type InspectionResult = {
   compliance: { overall_status: Status; rules: Rule[] };
 };
 
-const API_URL = "http://127.0.0.1:8000/inspect";
+const API_URL = `${process.env.NEXT_PUBLIC_API_URL}/inspect`;
 const productFields = [
   ["product_name", "Product name"],
   ["manufacturer", "Manufacturer"],

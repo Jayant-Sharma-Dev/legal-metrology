@@ -3,3 +3,5 @@ uvicorn[standard]==0.52.4
 SQLAlchemy==2.0.52
 psycopg[binary]==3.3.5
 python-dotenv==1.2.3
+python-multipart==0.0.20
+google-genai==1.57.0

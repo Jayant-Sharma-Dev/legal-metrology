@@ -1,220 +1,122 @@
-import json
 import os
-import subprocess
-import sys
+import base64
+import json
 import tempfile
 from pathlib import Path
 
-from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
+from dotenv import load_dotenv
+import google.generativeai as genai
 
-from app.gemini_extractor import extract_product_fields
-from app.rule_engine import evaluate_compliance
+load_dotenv()
 
-from app.database import SessionLocal
-
-
-BACKEND_ROOT = Path(__file__).resolve().parents[1]
-PROJECT_ROOT = BACKEND_ROOT.parent
-load_dotenv(BACKEND_ROOT / ".env")
-
-UPLOADS_DIR = PROJECT_ROOT / "uploads"
-OCR_SCRIPT = BACKEND_ROOT / "test_ocr.py"
-configured_ocr_python = os.getenv("OCR_PYTHON")
-OCR_PYTHON = Path(configured_ocr_python) if configured_ocr_python else Path(sys.executable)
-if not OCR_PYTHON.is_absolute():
-    OCR_PYTHON = BACKEND_ROOT / OCR_PYTHON
-OCR_TIMEOUT_SECONDS = 180
-
-app = FastAPI(title="Legal Metrology Compliance System")
+app = FastAPI(title="Legal Metrology API", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
-   allow_origins=[
-    "http://localhost:3000",
-    "https://legal-metrology-orcin.vercel.app",  # ← add this
-    "https://*.vercel.app",                        # ← covers preview deploys
-],
+    allow_origins=["*"],  # lock down after SIH demo
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ── Gemini setup ──────────────────────────────────────────────────────────────
+
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+model = genai.GenerativeModel("gemini-1.5-flash")
+
+EXTRACTION_PROMPT = """
+You are a Legal Metrology compliance inspector for India.
+
+Analyze this product label image and extract the following fields.
+Return ONLY valid JSON, no markdown, no explanation.
+
+{
+  "product_name": "string or null",
+  "manufacturer": "string or null",
+  "net_quantity": "string or null",
+  "unit": "string or null",
+  "mrp": "string or null",
+  "packing_date": "string or null",
+  "best_before": "string or null",
+  "consumer_care": "string or null",
+  "fssai_number": "string or null",
+  "country_of_origin": "string or null",
+  "raw_text": "all visible text on label as single string"
+}
+
+Rules:
+- Extract exactly what is printed. Do not infer or guess.
+- For net_quantity, extract the number only (e.g. "70" not "70g")
+- For unit, extract the unit only (e.g. "g", "ml", "pieces")
+- For mrp, extract digits only (e.g. "14" not "Rs.14" or "₹14")
+- If a field is not visible or not present, return null
+"""
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/")
-def health_check() -> dict[str, str]:
-    return {"status": "Legal Metrology backend is running"}
+async def root():
+    return {"status": "ok", "service": "Legal Metrology API"}
 
 
-def extract_json(stdout: str) -> dict:
-    """Extract the final JSON object after PaddleOCR's diagnostic output."""
-    decoder = json.JSONDecoder()
-    for index in range(len(stdout) - 1, -1, -1):
-        if stdout[index] != "{":
-            continue
-        try:
-            value, _ = decoder.raw_decode(stdout[index:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict) and "success" in value:
-            return value
-    raise ValueError("OCR process did not return a valid JSON result")
-
-
-async def _save_uploaded_image(file: UploadFile) -> Path:
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="An image file is required")
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="The uploaded file must be an image")
-
-    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-    suffix = Path(file.filename).suffix.lower() or ".img"
-    with tempfile.NamedTemporaryFile(
-        mode="wb",
-        suffix=suffix,
-        prefix="ocr_",
-        dir=UPLOADS_DIR,
-        delete=False,
-    ) as saved_file:
-        temporary_path = Path(saved_file.name)
-        while chunk := await file.read(1024 * 1024):
-            saved_file.write(chunk)
-    return temporary_path
-
-
-def _run_ocr(image_path: Path) -> dict:
-    try:
-        process = subprocess.run(
-            [str(OCR_PYTHON), str(OCR_SCRIPT), str(image_path)],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=OCR_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise HTTPException(status_code=504, detail="OCR process timed out") from error
-    except OSError as error:
-        raise HTTPException(status_code=500, detail=f"Could not run OCR: {error}") from error
-
-    if process.returncode != 0:
-        detail = process.stderr.strip() or process.stdout.strip()
-        raise HTTPException(
-            status_code=502,
-            detail=f"OCR process failed: {detail[-2000:]}",
-        )
-
-    try:
-        result = extract_json(process.stdout)
-    except ValueError as error:
-        raise HTTPException(status_code=502, detail=str(error)) from error
-
-    if not result.get("success"):
-        raise HTTPException(status_code=502, detail=result.get("error", "OCR failed"))
-    return result
-
-
-def _combine_ocr_text(ocr_result: dict) -> str:
-    return "\n".join(
-        str(line.get("text", ""))
-        for line in ocr_result.get("text", [])
-        if isinstance(line, dict) and line.get("text")
-    )
-
-
-@app.post("/ocr")
-async def run_ocr(file: UploadFile = File(...)):
-    temporary_path = None
-
-    try:
-        temporary_path = await _save_uploaded_image(file)
-        return _run_ocr(temporary_path)
-    except HTTPException:
-        raise
-    finally:
-        await file.close()
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
-
-
-@app.post("/extract")
-async def extract_fields(file: UploadFile = File(...)):
-    temporary_path = None
-
-    try:
-        temporary_path = await _save_uploaded_image(file)
-        ocr_result = _run_ocr(temporary_path)
-        ocr_lines = ocr_result.get("text", [])
-        ocr_text = _combine_ocr_text(ocr_result)
-
-        try:
-            extracted = extract_product_fields(ocr_text)
-        except Exception as error:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Gemini extraction failed: {error}",
-            ) from error
-
-        return {
-            "success": True,
-            "ocr": {"text": ocr_lines},
-            "extracted": extracted.model_dump(),
-        }
-    except HTTPException:
-        raise
-    finally:
-        await file.close()
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
 
 
 @app.post("/inspect")
-async def inspect_product(file: UploadFile = File(...)):
-    temporary_path = None
+async def inspect_product(image: UploadFile = File(...)):
+    """
+    Accepts a product label image.
+    Returns extracted fields via Gemini Vision.
+    """
+    # Validate
+    if not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
 
+    content = await image.read()
+
+    if len(content) > 10 * 1024 * 1024:  # 10MB limit
+        raise HTTPException(status_code=400, detail="Image too large (max 10MB)")
+
+    # Send to Gemini Vision
     try:
-        temporary_path = await _save_uploaded_image(file)
-        ocr_result = _run_ocr(temporary_path)
-        ocr_text = _combine_ocr_text(ocr_result)
+        image_part = {
+            "mime_type": image.content_type,
+            "data": base64.b64encode(content).decode("utf-8"),
+        }
 
-        try:
-            product_fields = extract_product_fields(ocr_text)
-        except Exception as error:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Gemini extraction failed: {error}",
-            ) from error
+        response = model.generate_content([
+            EXTRACTION_PROMPT,
+            {"inline_data": image_part},
+        ])
 
-        try:
-            compliance = evaluate_compliance(product_fields)
-        except Exception as error:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Compliance evaluation failed: {error}",
-            ) from error
+        raw = response.text.strip()
+
+        # Strip markdown fences if Gemini adds them
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+
+        extracted = json.loads(raw)
 
         return {
             "success": True,
-            "ocr": ocr_result,
-            "product": product_fields.model_dump(),
-            "compliance": compliance,
+            "extraction": extracted,
         }
-    except HTTPException:
-        raise
-    finally:
-        await file.close()
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
 
-
-
-@app.get("/health/db")
-def database_health_check() -> dict[str, bool | str]:
-    try:
-        with SessionLocal() as session:
-            session.execute(text("SELECT 1"))
-        return {"status": "ok", "database": True}
-    except SQLAlchemyError:
-        return {"status": "unavailable", "database": False}
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Gemini returned invalid JSON: {str(e)}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Extraction failed: {str(e)}"
+        )

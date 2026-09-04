@@ -1,8 +1,11 @@
 import json
+import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
@@ -14,10 +17,16 @@ from app.rule_engine import evaluate_compliance
 from app.database import SessionLocal
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = BACKEND_ROOT.parent
+load_dotenv(BACKEND_ROOT / ".env")
+
 UPLOADS_DIR = PROJECT_ROOT / "uploads"
-OCR_SCRIPT = PROJECT_ROOT / "backend" / "test_ocr.py"
-OCR_PYTHON = PROJECT_ROOT / "backend" / ".venv-paddle" / "Scripts" / "python.exe"
+OCR_SCRIPT = BACKEND_ROOT / "test_ocr.py"
+configured_ocr_python = os.getenv("OCR_PYTHON")
+OCR_PYTHON = Path(configured_ocr_python) if configured_ocr_python else Path(sys.executable)
+if not OCR_PYTHON.is_absolute():
+    OCR_PYTHON = BACKEND_ROOT / OCR_PYTHON
 OCR_TIMEOUT_SECONDS = 180
 
 app = FastAPI(title="Legal Metrology Compliance System")

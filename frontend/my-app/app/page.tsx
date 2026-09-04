@@ -68,7 +68,7 @@ export default function Home() {
     setResult(null);
     try {
       const formData = new FormData();
-      formData.append("file", file);
+      formData.append("image", file);
       const response = await fetch(API_URL, { method: "POST", body: formData });
       const payload = await response.json().catch(() => null);
       if (!response.ok) throw new Error(typeof payload?.detail === "string" ? payload.detail : "The inspection request failed.");

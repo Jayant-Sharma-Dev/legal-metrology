@@ -36,14 +36,18 @@ Return ONLY valid JSON — no markdown, no code fences, no explanation.
 {
   "product_name": "string or null",
   "manufacturer": "string or null",
+  "packer": "string or null",
+  "importer": "string or null",
   "net_quantity": "string or null",
   "unit": "string or null",
   "mrp": "string or null",
-  "packing_date": "string or null",
-  "best_before": "string or null",
+  "batch_number": "string or null",
+  "manufacturing_date": "string or null",
+  "expiry_date": "string or null",
   "consumer_care": "string or null",
   "fssai_number": "string or null",
   "country_of_origin": "string or null",
+  "category": "string or null",
   "raw_text": "all visible text on the label as a single string"
 }
 
@@ -54,6 +58,117 @@ Rules:
 - For mrp, extract digits only (e.g. "14" not "Rs.14" or "₹14").
 - If a field is not visible or not present, return null.
 """
+
+# ── Rule engine ───────────────────────────────────────────────────────────────
+
+RULES = [
+    {
+        "rule_id": "LM-01",
+        "requirement": "Product name or generic name must be declared",
+        "field": "product_name",
+        "legal_reference": "Rule 6(1) — Name or generic name of the commodity",
+    },
+    {
+        "rule_id": "LM-02",
+        "requirement": "Name and address of manufacturer or packer must be present",
+        "field": "manufacturer",
+        "legal_reference": "Rule 6(2) — Name and address of manufacturer/packer",
+    },
+    {
+        "rule_id": "LM-03",
+        "requirement": "Net quantity must be declared",
+        "field": "net_quantity",
+        "legal_reference": "Rule 6(3) — Net quantity in standard units",
+    },
+    {
+        "rule_id": "LM-04",
+        "requirement": "Maximum Retail Price (MRP) must be declared",
+        "field": "mrp",
+        "legal_reference": "Rule 6(4) — Retail sale price inclusive of all taxes",
+    },
+    {
+        "rule_id": "LM-05",
+        "requirement": "Month and year of manufacture or packing must be present",
+        "field": "manufacturing_date",
+        "legal_reference": "Rule 6(5) — Month and year of manufacture/packing",
+    },
+    {
+        "rule_id": "LM-06",
+        "requirement": "Best before or expiry date must be declared",
+        "field": "expiry_date",
+        "legal_reference": "Rule 6(6) — Best before or expiry date",
+    },
+    {
+        "rule_id": "LM-07",
+        "requirement": "Consumer care details (address or helpline) must be present",
+        "field": "consumer_care",
+        "legal_reference": "Rule 6(7) — Consumer care number or address",
+    },
+    {
+        "rule_id": "LM-08",
+        "requirement": "FSSAI licence number required for food products",
+        "field": "fssai_number",
+        "legal_reference": "FSS Act 2006 — FSSAI registration/licence number",
+    },
+    {
+        "rule_id": "LM-09",
+        "requirement": "Country of origin must be declared for imported goods",
+        "field": "country_of_origin",
+        "legal_reference": "Rule 6(8) — Country of origin for imported commodities",
+    },
+    {
+        "rule_id": "LM-10",
+        "requirement": "Batch or lot number must be declared",
+        "field": "batch_number",
+        "legal_reference": "Rule 6(9) — Batch, lot, or code number",
+    },
+]
+
+
+def run_compliance(product: dict) -> dict:
+    """
+    Run deterministic compliance checks against extracted product fields.
+    Returns overall_status and per-rule results matching frontend shape.
+    """
+    rules_result = []
+
+    for rule in RULES:
+        field = rule["field"]
+        value = product.get(field)
+        has_value = value is not None and str(value).strip() != ""
+
+        # country_of_origin: REVIEW if null (may be domestic, not imported)
+        if field == "country_of_origin" and not has_value:
+            status = "REVIEW"
+            explanation = "Not detected. Required only for imported goods — verify if applicable."
+        elif has_value:
+            status = "PASS"
+            explanation = f"Declared on label: {value}"
+        else:
+            status = "FAIL"
+            explanation = f"Not found on label. This is a mandatory declaration under {rule['legal_reference']}."
+
+        rules_result.append({
+            "rule_id": rule["rule_id"],
+            "requirement": rule["requirement"],
+            "status": status,
+            "field": field,
+            "value": value,
+            "explanation": explanation,
+            "legal_reference": rule["legal_reference"],
+        })
+
+    # Overall: FAIL if any FAIL, REVIEW if any REVIEW, else PASS
+    statuses = [r["status"] for r in rules_result]
+    if "FAIL" in statuses:
+        overall = "FAIL"
+    elif "REVIEW" in statuses:
+        overall = "REVIEW"
+    else:
+        overall = "PASS"
+
+    return {"overall_status": overall, "rules": rules_result}
+
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
@@ -67,13 +182,14 @@ async def health():
     return {"status": "healthy"}
 
 
+@app.get("/models")
+async def list_models():
+    models = client.models.list()
+    return {"models": [m.name for m in models]}
+
+
 @app.post("/inspect")
 async def inspect_product(image: UploadFile = File(...)):
-    """
-    Accept a product label image.
-    Return Gemini-extracted fields as structured JSON.
-    """
-
     # ── validate ──────────────────────────────────────────────────────────────
     if not image.content_type or not image.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
@@ -83,7 +199,8 @@ async def inspect_product(image: UploadFile = File(...)):
     if len(content) > 10 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="Image too large (max 10 MB)")
 
-    # ── call Gemini Vision ────────────────────────────────────────────────────
+    # ── Gemini Vision extraction ───────────────────────────────────────────────
+    raw = ""
     try:
         image_part = types.Part.from_bytes(
             data=content,
@@ -91,16 +208,15 @@ async def inspect_product(image: UploadFile = File(...)):
         )
 
         response = client.models.generate_content(
-            model="gemini-3.6-flash",
+            model="gemini-2.5-flash",
             contents=[image_part, EXTRACTION_PROMPT],
         )
 
         raw = response.text.strip()
 
-        # Strip markdown fences Gemini sometimes adds despite instructions
+        # Strip markdown fences Gemini sometimes adds
         if raw.startswith("```"):
             lines = raw.splitlines()
-            # drop first line (```json or ```) and last line (```)
             raw = "\n".join(lines[1:-1]).strip()
 
         extracted = json.loads(raw)
@@ -108,7 +224,7 @@ async def inspect_product(image: UploadFile = File(...)):
     except json.JSONDecodeError as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Gemini returned invalid JSON: {e}. Raw: {raw[:300]}",
+            detail=f"Gemini returned invalid JSON: {e}. Raw response: {raw[:300]}",
         )
     except Exception as e:
         raise HTTPException(
@@ -116,7 +232,38 @@ async def inspect_product(image: UploadFile = File(...)):
             detail=f"Extraction failed: {type(e).__name__}: {e}",
         )
 
+    # ── Build product fields (matches frontend productFields list) ─────────────
+    product = {
+        "product_name":      extracted.get("product_name"),
+        "manufacturer":      extracted.get("manufacturer"),
+        "packer":            extracted.get("packer"),
+        "importer":          extracted.get("importer"),
+        "net_quantity":      (
+            f"{extracted.get('net_quantity')} {extracted.get('unit') or ''}".strip()
+            if extracted.get("net_quantity") else None
+        ),
+        "mrp":               extracted.get("mrp"),
+        "batch_number":      extracted.get("batch_number"),
+        "manufacturing_date": extracted.get("manufacturing_date"),
+        "expiry_date":       extracted.get("expiry_date"),
+        "category":          extracted.get("category"),
+    }
+
+    # ── Run rule engine ───────────────────────────────────────────────────────
+    # Pass raw extracted fields (not formatted product) so rules check each field
+    compliance = run_compliance(extracted)
+
+    # ── Build OCR evidence from raw_text ──────────────────────────────────────
+    raw_text = extracted.get("raw_text", "") or ""
+    ocr_lines = [
+        {"text": line.strip(), "confidence": 1.0, "box": []}
+        for line in raw_text.split("\n")
+        if line.strip()
+    ] if raw_text else []
+
     return {
-        "success": True,
-        "extraction": extracted,
+        "success":    True,
+        "ocr":        {"success": True, "text": ocr_lines},
+        "product":    product,
+        "compliance": compliance,
     }

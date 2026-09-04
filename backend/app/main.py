@@ -24,6 +24,10 @@ app.add_middleware(
 # ── Gemini client ─────────────────────────────────────────────────────────────
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+@app.get("/models")
+async def list_models():
+    models = client.models.list()
+    return {"models": [m.name for m in models]}
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
 

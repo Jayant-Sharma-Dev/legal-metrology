@@ -30,7 +30,7 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 EXTRACTION_PROMPT = """
 You are a Legal Metrology compliance inspector for India.
 
-Analyze this product label image and extract the following fields.
+The uploaded images are different views of the SAME packaged product. Inspect ALL images before extracting the following fields and combine information across them.
 Return ONLY valid JSON — no markdown, no code fences, no explanation.
 
 {
@@ -48,10 +48,15 @@ Return ONLY valid JSON — no markdown, no code fences, no explanation.
   "fssai_number": "string or null",
   "country_of_origin": "string or null",
   "category": "string or null",
-  "raw_text": "all visible text on the label as a single string"
+    "raw_text": "all visible text across all images as a single string",
+    "conflicts": []
 }
 
 Rules:
+- Treat all uploaded images as views of one product, not separate products.
+- Do not claim a declaration is absent merely because it is not visible in one image.
+- If a field appears on any image, use the detected value.
+- If images contain conflicting values for a field, do not guess. Return the safest available value or null and add a short description to conflicts.
 - Extract exactly what is printed. Do not infer or guess.
 - For net_quantity, extract the number only (e.g. "70" not "70g").
 - For unit, extract the unit only (e.g. "g", "ml", "pieces").
@@ -189,27 +194,28 @@ async def list_models():
 
 
 @app.post("/inspect")
-async def inspect_product(image: UploadFile = File(...)):
+async def inspect_product(images: list[UploadFile] = File(..., alias="image")):
     # ── validate ──────────────────────────────────────────────────────────────
-    if not image.content_type or not image.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image")
+    if not images or len(images) > 3:
+        raise HTTPException(status_code=400, detail="Upload between 1 and 3 product images")
 
-    content = await image.read()
+    image_parts = []
+    for image in images:
+        if not image.content_type or not image.content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail="Every uploaded file must be an image")
 
-    if len(content) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="Image too large (max 10 MB)")
+        content = await image.read()
+        if len(content) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="Each image must be 10 MB or smaller")
+
+        image_parts.append(types.Part.from_bytes(data=content, mime_type=image.content_type))
 
     # ── Gemini Vision extraction ───────────────────────────────────────────────
     raw = ""
     try:
-        image_part = types.Part.from_bytes(
-            data=content,
-            mime_type=image.content_type,
-        )
-
         response = client.models.generate_content(
             model="gemini-3.6-flash",
-            contents=[image_part, EXTRACTION_PROMPT],
+            contents=[*image_parts, EXTRACTION_PROMPT],
         )
 
         raw = response.text.strip()
@@ -266,4 +272,5 @@ async def inspect_product(image: UploadFile = File(...)):
         "ocr":        {"success": True, "text": ocr_lines},
         "product":    product,
         "compliance": compliance,
+        "extraction_review": extracted.get("conflicts", []),
     }

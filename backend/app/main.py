@@ -1,6 +1,9 @@
 import os
 import json
 import logging
+import asyncio
+import io
+import time
 from contextlib import asynccontextmanager
 from typing import Annotated
 from fastapi import Depends, FastAPI, UploadFile, File, HTTPException
@@ -11,12 +14,37 @@ from google.genai import types
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
+from PIL import Image, ImageOps
 
 from app.database import Base, Inspection, engine, get_db
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+MAX_IMAGE_DIMENSION = 2400
+IMAGE_COMPRESSION_THRESHOLD = 2 * 1024 * 1024
+
+
+def prepare_image(content: bytes, mime_type: str) -> tuple[bytes, str]:
+    """Keep small images untouched and reduce oversized images for Vision."""
+    with Image.open(io.BytesIO(content)) as source:
+        width, height = source.size
+        if max(width, height) <= MAX_IMAGE_DIMENSION and len(content) <= IMAGE_COMPRESSION_THRESHOLD:
+            return content, mime_type
+
+        image = ImageOps.exif_transpose(source)
+        image.thumbnail((MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION), Image.Resampling.LANCZOS)
+        if image.mode in ("RGBA", "LA"):
+            background = Image.new("RGB", image.size, "white")
+            background.paste(image, mask=image.getchannel("A"))
+            image = background
+        else:
+            image = image.convert("RGB")
+
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=85, optimize=True)
+        return output.getvalue(), "image/jpeg"
 
 
 @asynccontextmanager
@@ -66,6 +94,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def log_inspect_duration(request, call_next):
+    started = time.perf_counter()
+    try:
+        return await call_next(request)
+    finally:
+        if request.url.path == "/inspect":
+            logger.info("/inspect total duration: %.1f ms", (time.perf_counter() - started) * 1000)
 
 # ── Gemini client ─────────────────────────────────────────────────────────────
 
@@ -248,7 +286,10 @@ async def inspect_product(
     if not image or len(image) > 3:
         raise HTTPException(status_code=400, detail="Upload between 1 and 3 product images")
 
+    preparation_started = time.perf_counter()
     image_parts = []
+    original_bytes = 0
+    prepared_bytes = 0
     for uploaded_image in image:
         if not uploaded_image.content_type or not uploaded_image.content_type.startswith("image/"):
             raise HTTPException(status_code=400, detail="Every uploaded file must be an image")
@@ -257,12 +298,29 @@ async def inspect_product(
         if len(content) > 10 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="Each image must be 10 MB or smaller")
 
-        image_parts.append(types.Part.from_bytes(data=content, mime_type=uploaded_image.content_type))
+        try:
+            prepared, prepared_mime = prepare_image(content, uploaded_image.content_type)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="Each uploaded file must be a valid image") from exc
+
+        original_bytes += len(content)
+        prepared_bytes += len(prepared)
+        image_parts.append(types.Part.from_bytes(data=prepared, mime_type=prepared_mime))
+
+    logger.info(
+        "Image preparation: %d images, %d -> %d bytes in %.1f ms",
+        len(image_parts),
+        original_bytes,
+        prepared_bytes,
+        (time.perf_counter() - preparation_started) * 1000,
+    )
 
     # ── Gemini Vision extraction ───────────────────────────────────────────────
     raw = ""
+    gemini_started = time.perf_counter()
     try:
-        response = client.models.generate_content(
+        response = await asyncio.to_thread(
+            client.models.generate_content,
             model="gemini-3.6-flash",
             contents=[*image_parts, EXTRACTION_PROMPT],
         )
@@ -286,6 +344,8 @@ async def inspect_product(
             status_code=500,
             detail=f"Extraction failed: {type(e).__name__}: {e}",
         )
+    finally:
+        logger.info("Gemini request: %.1f ms", (time.perf_counter() - gemini_started) * 1000)
 
     # ── Build product fields (matches frontend productFields list) ─────────────
     product = {
@@ -306,7 +366,9 @@ async def inspect_product(
 
     # ── Run rule engine ───────────────────────────────────────────────────────
     # Pass raw extracted fields (not formatted product) so rules check each field
+    rules_started = time.perf_counter()
     compliance = run_compliance(extracted)
+    logger.info("Rule evaluation: %.1f ms", (time.perf_counter() - rules_started) * 1000)
 
     # ── Build OCR evidence from raw_text ──────────────────────────────────────
     raw_text = extracted.get("raw_text", "") or ""
@@ -324,6 +386,7 @@ async def inspect_product(
         "extraction_review": extracted.get("conflicts", []),
     }
 
+    database_started = time.perf_counter()
     try:
         statuses = [rule["status"] for rule in compliance["rules"]]
         inspection = Inspection(
@@ -344,11 +407,7 @@ async def inspect_product(
             compliance_data=compliance,
         )
         db.add(inspection)
-        db.flush()
-        logger.info("Prepared inspection history record id=%s", inspection.id)
         db.commit()
-        db.refresh(inspection)
-        logger.info("Saved inspection history record id=%s", inspection.id)
     except Exception:
         db.rollback()
         logger.exception(
@@ -356,6 +415,8 @@ async def inspect_product(
             compliance.get("overall_status"),
             product.get("product_name"),
         )
+    finally:
+        logger.info("Database save: %.1f ms", (time.perf_counter() - database_started) * 1000)
 
     return response_payload
 

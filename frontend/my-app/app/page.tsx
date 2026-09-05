@@ -22,6 +22,9 @@ type InspectionResult = {
   product: Product;
   compliance: { overall_status: Status; rules: Rule[] };
 };
+type LoadingStage = "Uploading images" | "Reading label" | "Checking compliance" | "Finalizing report";
+
+const loadingStages: LoadingStage[] = ["Uploading images", "Reading label", "Checking compliance", "Finalizing report"];
 
 const API_URL = `${process.env.NEXT_PUBLIC_API_URL}/inspect`;
 const productFields = [
@@ -67,6 +70,7 @@ export default function Home() {
   const [result, setResult] = useState<InspectionResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [loadingStage, setLoadingStage] = useState<LoadingStage>(loadingStages[0]);
 
   function handleImageChange(index: number, event: ChangeEvent<HTMLInputElement>) {
     const selectedFile = event.target.files?.[0] ?? null;
@@ -90,16 +94,28 @@ export default function Home() {
     const selected = imageFiles.filter((f): f is File => f !== null);
     if (selected.length === 0) { setError("Choose a product image before starting an inspection."); return; }
     setIsLoading(true); setError(null); setResult(null);
+    setLoadingStage(loadingStages[0]);
+    let stageTimer: number | undefined;
     try {
       const formData = new FormData();
       selected.forEach((img) => formData.append("image", img, img.name));
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      setLoadingStage(loadingStages[1]);
+      stageTimer = window.setInterval(() => {
+        setLoadingStage((current) => {
+          const nextIndex = Math.min(loadingStages.indexOf(current) + 1, loadingStages.length - 2);
+          return loadingStages[nextIndex];
+        });
+      }, 900);
       const response = await fetch(API_URL, { method: "POST", body: formData });
+      setLoadingStage(loadingStages[3]);
       const payload = await response.json().catch(() => null);
       if (!response.ok) throw new Error(typeof payload?.detail === "string" ? payload.detail : "The inspection request failed.");
       setResult(payload as InspectionResult);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Unable to reach the inspection service.");
     } finally {
+      if (stageTimer !== undefined) window.clearInterval(stageTimer);
       setIsLoading(false);
     }
   }
@@ -266,9 +282,18 @@ export default function Home() {
             className="mt-5 flex w-full items-center justify-center gap-2.5 rounded-xl bg-[#d96b42] px-5 py-3.5 text-sm font-bold text-white shadow-[0_6px_16px_rgba(217,107,66,0.25)] transition hover:bg-[#bf5934] disabled:cursor-not-allowed disabled:opacity-60"
           >
             {isLoading
-              ? <><span className="h-4 w-4 animate-spin rounded-full border-2 border-white/40 border-t-white" />Reading label…</>
+              ? <><span className="h-4 w-4 animate-spin rounded-full border-2 border-white/40 border-t-white" />{loadingStage}</>
               : <>Inspect product <span aria-hidden="true">→</span></>}
           </button>
+          {isLoading && (
+            <div className="mt-4 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4" aria-live="polite">
+              {loadingStages.map((stage, index) => (
+                <div key={stage} className={`rounded-lg border px-2.5 py-2 ${stage === loadingStage ? "border-[#d96b42] bg-[#fff1eb] font-bold text-[#a64d2d]" : index < loadingStages.indexOf(loadingStage) ? "border-[#cbd7cf] bg-[#eef4ef] text-[#526a60]" : "border-[#e1e1d9] bg-[#f8faf6] text-[#8a958e]"}`}>
+                  {stage}
+                </div>
+              ))}
+            </div>
+          )}
           {error && (
             <div role="alert" className="mt-4 rounded-xl border border-red-200 bg-red-50 p-3 text-sm leading-5 text-red-800">
               {error}

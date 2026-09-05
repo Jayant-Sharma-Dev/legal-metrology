@@ -2,7 +2,7 @@ import os
 import json
 import logging
 from contextlib import asynccontextmanager
-
+from typing import Annotated
 from fastapi import Depends, FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -214,27 +214,23 @@ async def list_models():
 
 @app.post("/inspect")
 async def inspect_product(
-    images: list[UploadFile] = File(
-        ...,
-        alias="image",
-        json_schema_extra={"items": {"type": "string", "format": "binary"}},
-    ),
+       image: Annotated[list[UploadFile], File(description="Product label images (up to 3)")],
     db: Session = Depends(get_db),
 ):
     # ── validate ──────────────────────────────────────────────────────────────
-    if not images or len(images) > 3:
+    if not image or len(image) > 3:
         raise HTTPException(status_code=400, detail="Upload between 1 and 3 product images")
 
     image_parts = []
-    for image in images:
-        if not image.content_type or not image.content_type.startswith("image/"):
+    for uploaded_image in image:
+        if not uploaded_image.content_type or not uploaded_image.content_type.startswith("image/"):
             raise HTTPException(status_code=400, detail="Every uploaded file must be an image")
 
-        content = await image.read()
+        content = await uploaded_image.read()
         if len(content) > 10 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="Each image must be 10 MB or smaller")
 
-        image_parts.append(types.Part.from_bytes(data=content, mime_type=image.content_type))
+        image_parts.append(types.Part.from_bytes(data=content, mime_type=uploaded_image.content_type))
 
     # ── Gemini Vision extraction ───────────────────────────────────────────────
     raw = ""

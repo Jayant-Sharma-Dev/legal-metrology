@@ -1,17 +1,35 @@
 import os
 import json
+import logging
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import Depends, FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
+
+from app.database import Base, Inspection, engine, get_db
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    try:
+        Base.metadata.create_all(bind=engine)
+    except SQLAlchemyError:
+        logger.exception("Unable to initialize inspection history table")
+    yield
+
 # ── App ───────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Legal Metrology API", version="0.2.0")
+app = FastAPI(title="Legal Metrology API", version="0.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -194,7 +212,10 @@ async def list_models():
 
 
 @app.post("/inspect")
-async def inspect_product(images: list[UploadFile] = File(..., alias="image")):
+async def inspect_product(
+    images: list[UploadFile] = File(..., alias="image"),
+    db: Session = Depends(get_db),
+):
     # ── validate ──────────────────────────────────────────────────────────────
     if not images or len(images) > 3:
         raise HTTPException(status_code=400, detail="Upload between 1 and 3 product images")
@@ -267,10 +288,86 @@ async def inspect_product(images: list[UploadFile] = File(..., alias="image")):
         if line.strip()
     ] if raw_text else []
 
-    return {
+    response_payload = {
         "success":    True,
         "ocr":        {"success": True, "text": ocr_lines},
         "product":    product,
         "compliance": compliance,
         "extraction_review": extracted.get("conflicts", []),
     }
+
+    try:
+        statuses = [rule["status"] for rule in compliance["rules"]]
+        db.add(Inspection(
+            overall_status=compliance["overall_status"],
+            product_name=product.get("product_name"),
+            manufacturer=product.get("manufacturer"),
+            packer=product.get("packer"),
+            importer=product.get("importer"),
+            net_quantity=product.get("net_quantity"),
+            mrp=product.get("mrp"),
+            batch_number=product.get("batch_number"),
+            manufacturing_date=product.get("manufacturing_date"),
+            expiry_date=product.get("expiry_date"),
+            category=product.get("category"),
+            violation_count=statuses.count("FAIL"),
+            review_count=statuses.count("REVIEW"),
+            product_data=product,
+            compliance_data=compliance,
+        ))
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Unable to save inspection history")
+
+    return response_payload
+
+
+def inspection_to_dict(inspection: Inspection) -> dict:
+    return {
+        "id": inspection.id,
+        "created_at": inspection.created_at.isoformat() if inspection.created_at else None,
+        "overall_status": inspection.overall_status,
+        "product_name": inspection.product_name,
+        "manufacturer": inspection.manufacturer,
+        "packer": inspection.packer,
+        "importer": inspection.importer,
+        "net_quantity": inspection.net_quantity,
+        "mrp": inspection.mrp,
+        "batch_number": inspection.batch_number,
+        "manufacturing_date": inspection.manufacturing_date,
+        "expiry_date": inspection.expiry_date,
+        "category": inspection.category,
+        "violation_count": inspection.violation_count,
+        "review_count": inspection.review_count,
+        "product_data": inspection.product_data,
+        "compliance_data": inspection.compliance_data,
+    }
+
+
+def inspection_summary_to_dict(inspection: Inspection) -> dict:
+    return {
+        "id": inspection.id,
+        "created_at": inspection.created_at.isoformat() if inspection.created_at else None,
+        "product_name": inspection.product_name,
+        "manufacturer": inspection.manufacturer,
+        "overall_status": inspection.overall_status,
+        "violation_count": inspection.violation_count,
+        "review_count": inspection.review_count,
+    }
+
+
+@app.get("/inspections")
+async def list_inspections(db: Session = Depends(get_db)):
+    inspections = db.scalars(
+        select(Inspection).order_by(Inspection.created_at.desc(), Inspection.id.desc())
+    ).all()
+    return [inspection_summary_to_dict(inspection) for inspection in inspections]
+
+
+@app.get("/inspections/{inspection_id}")
+async def get_inspection(inspection_id: int, db: Session = Depends(get_db)):
+    inspection = db.get(Inspection, inspection_id)
+    if inspection is None:
+        raise HTTPException(status_code=404, detail="Inspection not found")
+    return inspection_to_dict(inspection)

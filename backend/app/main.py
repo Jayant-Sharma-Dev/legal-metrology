@@ -214,7 +214,11 @@ async def list_models():
 
 @app.post("/inspect")
 async def inspect_product(
-    images: list[UploadFile] = File(..., alias="image"),
+    images: list[UploadFile] = File(
+        ...,
+        alias="image",
+        json_schema_extra={"items": {"type": "string", "format": "binary"}},
+    ),
     db: Session = Depends(get_db),
 ):
     # ── validate ──────────────────────────────────────────────────────────────
@@ -299,7 +303,7 @@ async def inspect_product(
 
     try:
         statuses = [rule["status"] for rule in compliance["rules"]]
-        db.add(Inspection(
+        inspection = Inspection(
             overall_status=compliance["overall_status"],
             product_name=product.get("product_name"),
             manufacturer=product.get("manufacturer"),
@@ -315,11 +319,20 @@ async def inspect_product(
             review_count=statuses.count("REVIEW"),
             product_data=product,
             compliance_data=compliance,
-        ))
+        )
+        db.add(inspection)
+        db.flush()
+        logger.info("Prepared inspection history record id=%s", inspection.id)
         db.commit()
-    except SQLAlchemyError:
+        db.refresh(inspection)
+        logger.info("Saved inspection history record id=%s", inspection.id)
+    except Exception:
         db.rollback()
-        logger.exception("Unable to save inspection history")
+        logger.exception(
+            "Unable to save inspection history: status=%s product_name=%r",
+            compliance.get("overall_status"),
+            product.get("product_name"),
+        )
 
     return response_payload
 

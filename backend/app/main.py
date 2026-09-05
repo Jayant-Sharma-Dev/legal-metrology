@@ -25,6 +25,7 @@ async def lifespan(_app: FastAPI):
         Base.metadata.create_all(bind=engine)
     except SQLAlchemyError:
         logger.exception("Unable to initialize inspection history table")
+        raise
     yield
 
 # ── App ───────────────────────────────────────────────────────────────────────

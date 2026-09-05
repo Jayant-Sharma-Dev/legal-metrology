@@ -31,6 +31,33 @@ async def lifespan(_app: FastAPI):
 # ── App ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="Legal Metrology API", version="0.2.0", lifespan=lifespan)
+from fastapi.openapi.utils import get_openapi
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        routes=app.routes,
+    )
+    # Fix /inspect image field to show array<binary> instead of array<string>
+    try:
+        body = schema["paths"]["/inspect"]["post"]["requestBody"]
+        content = body["content"]["multipart/form-data"]["schema"]
+        if "$ref" in content:
+            reference_name = content["$ref"].rsplit("/", 1)[-1]
+            content = schema["components"]["schemas"][reference_name]
+        content.setdefault("properties", {})["image"] = {
+            "type": "array",
+            "items": {"type": "string", "format": "binary"},
+        }
+    except KeyError:
+        pass
+    app.openapi_schema = schema
+    return schema
+
+app.openapi = custom_openapi  # type: ignore
 
 app.add_middleware(
     CORSMiddleware,

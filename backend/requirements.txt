@@ -2,6 +2,7 @@ fastapi==0.141.1
 uvicorn[standard]==0.52.4
 SQLAlchemy==2.0.52
 psycopg[binary]==3.3.5
+psycopg2-binary
 python-dotenv==1.2.3
 python-multipart==0.0.20
 google-genai==1.57.0
